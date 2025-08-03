@@ -1,0 +1,294 @@
+/*
+ * ESP32 WiFi ESC Controller
+ *
+ * This sketch creates a Wi-Fi access point and hosts a web server to control
+ * two SimonK-compatible ESCs using a single set of controls.
+ *
+ * This version uses the official and well-supported ESP32Servo library,
+ * which is a direct port of the standard Arduino Servo library for the ESP32.
+ *
+ * Features:
+ * - Creates a Wi-Fi Access Point (AP) named "ESP32-ESC-AP" with password "password123".
+ * - A web page allows the user to:
+ * - Set minimum and maximum PWM pulse widths (in microseconds).
+ * - Control both ESCs simultaneously with a single slider.
+ * - The GPIO pins for the ESCs are permanently set to GPIO 2 and GPIO 4.
+ *
+ * Requirements:
+ * - An ESP32 development board.
+ * - Arduino IDE with ESP32 board support.
+ * - ESPAsyncWebServer library (from library manager).
+ * - AsyncTCP library (from library manager).
+ * - ESP32Servo library (from Arduino Library Manager).
+ */
+
+#include <WiFi.h>
+#include <ESPAsyncWebServer.h>
+#include <ESP32Servo.h> // The correct and standard library for ESP32
+
+// --- Wi-Fi Configuration ---
+const char* ssid = "ESP32-ESC-AP";
+const char* password = "password123";
+
+// --- Web Server Configuration ---
+AsyncWebServer server(80);
+
+// --- ESC Configuration (Hardcoded Pins and Default Values) ---
+const int esc1_pin = 2;       // Permanent GPIO pin for ESC 1
+const int esc2_pin = 4;       // Permanent GPIO pin for ESC 2
+int current_min_pwm = 1000; // Default minimum PWM in microseconds
+int current_max_pwm = 2000; // Default maximum PWM in microseconds
+
+// Servo objects for each ESC
+// The class name for the ESP32Servo library is also 'Servo'
+Servo esc1;
+Servo esc2;
+
+// --- HTML and JavaScript Content ---
+const char* index_html = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+    <title>ESP32 ESC Controller</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            background-color: #f0f4f8;
+            margin: 0;
+            padding: 20px;
+            color: #333;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+        .container {
+            background-color: #ffffff;
+            padding: 25px;
+            border-radius: 12px;
+            box-shadow: 0 4px 15px rgba(0, 0, 0, 0.1);
+            max-width: 600px;
+            width: 100%;
+            margin-bottom: 20px;
+        }
+        h1 {
+            color: #2c3e50;
+            text-align: center;
+            margin-bottom: 20px;
+        }
+        .esc-section {
+            border: 2px solid #e0e0e0;
+            border-radius: 8px;
+            padding: 15px;
+            margin-top: 20px;
+        }
+        .esc-section h2 {
+            color: #34495e;
+            margin-top: 0;
+            border-bottom: 2px solid #3498db;
+            padding-bottom: 10px;
+        }
+        .controls {
+            display: flex;
+            flex-direction: column;
+            gap: 15px;
+        }
+        .control-group {
+            display: flex;
+            flex-direction: column;
+            gap: 5px;
+        }
+        label {
+            font-weight: bold;
+            color: #555;
+        }
+        input[type="number"], input[type="range"] {
+            width: 100%;
+            padding: 8px;
+            box-sizing: border-box;
+            border: 1px solid #ccc;
+            border-radius: 4px;
+            transition: all 0.3s ease;
+        }
+        input[type="number"]:focus, input[type="range"]:focus {
+            outline: none;
+            border-color: #3498db;
+            box-shadow: 0 0 5px rgba(52, 152, 219, 0.5);
+        }
+        .slider-group {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        .slider-group span {
+            min-width: 40px;
+            text-align: right;
+            font-weight: bold;
+        }
+        input[type="range"] {
+            -webkit-appearance: none;
+            height: 8px;
+            background: #ddd;
+            cursor: pointer;
+        }
+        input[type="range"]::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            width: 20px;
+            height: 20px;
+            background: #3498db;
+            border-radius: 50%;
+            box-shadow: 0 2px 5px rgba(0, 0, 0, 0.2);
+        }
+        input[type="range"]::-moz-range-thumb {
+            width: 20px;
+            height: 20px;
+            background: #3498db;
+            border-radius: 50%;
+            border: none;
+            box-shadow: 0 2px 5px rgba(0, 0, 0, 0.2);
+        }
+        .info {
+            font-style: italic;
+            color: #777;
+            text-align: center;
+            margin-top: 10px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>ESP32 Dual ESC Controller</h1>
+        <div class="info">
+            Controls ESCs on GPIO 2 and GPIO 4.
+        </div>
+
+        <div class="esc-section">
+            <h2>Throttle Control</h2>
+            <div class="controls">
+                <div class="control-group">
+                    <label for="min_pwm">Min PWM (µs)</label>
+                    <input type="number" id="min_pwm" value="1000" min="100" max="10000">
+                </div>
+                <div class="control-group">
+                    <label for="max_pwm">Max PWM (µs)</label>
+                    <input type="number" id="max_pwm" value="2000" min="100" max="10000">
+                </div>
+                <div class="control-group">
+                    <label for="slider">Throttle Control</label>
+                    <div class="slider-group">
+                        <input type="range" id="slider" min="1000" max="2000" value="1000">
+                        <span id="slider_value">1000</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Helper function to update the slider range based on min/max inputs
+        function updateSliderRange() {
+            const minInput = document.getElementById('min_pwm');
+            const maxInput = document.getElementById('max_pwm');
+            const slider = document.getElementById('slider');
+
+            const minVal = parseInt(minInput.value, 10);
+            const maxVal = parseInt(maxInput.value, 10);
+
+            if (minVal < maxVal) {
+                slider.min = minVal;
+                slider.max = maxVal;
+            }
+        }
+
+        // Helper function to send an AJAX request to the ESP32
+        function sendPWM(value) {
+            const url = `/update?value=${value}`;
+            fetch(url).catch(error => console.error('Error sending request:', error));
+        }
+
+        // Event listener for the main slider
+        document.getElementById('slider').addEventListener('input', (e) => {
+            const value = e.target.value;
+            document.getElementById('slider_value').innerText = value;
+            sendPWM(value);
+        });
+
+        // Event listeners for min/max inputs
+        document.getElementById('min_pwm').addEventListener('change', () => updateSliderRange());
+        document.getElementById('max_pwm').addEventListener('change', () => updateSliderRange());
+
+        // Initial setup for the slider on page load
+        window.addEventListener('load', () => {
+            updateSliderRange();
+        });
+
+    </script>
+</body>
+</html>
+)rawliteral";
+
+// --- Function Prototypes ---
+void set_dual_esc_pwm(int value_us);
+
+// --- Setup Function ---
+void setup() {
+  Serial.begin(115200);
+
+  // Attach servos to the pins. The library handles PWM generation.
+  // Note: the `attach()` method uses the `min` and `max` pulse width
+  // arguments to set the boundaries for the PWM signal. The default values
+  // are 544 and 2400, so we will use the default `attach()` for simplicity,
+  // as the web UI handles the min/max values dynamically.
+  esc1.attach(esc1_pin);
+  esc2.attach(esc2_pin);
+
+  // Set default PWM values for safety
+  set_dual_esc_pwm(current_min_pwm);
+
+  // Configure ESP32 as a Wi-Fi Access Point
+  Serial.print("Setting up AP...");
+  WiFi.softAP(ssid, password);
+  IPAddress IP = WiFi.softAPIP();
+  Serial.print("AP IP address: ");
+  Serial.println(IP);
+
+  // Setup Web Server Routes
+  // Route to serve the HTML page
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
+    request->send_P(200, "text/html", index_html);
+  });
+
+  // Route to handle slider updates
+  server.on("/update", HTTP_GET, [](AsyncWebServerRequest *request){
+    if (request->hasParam("value")) {
+      int value = request->getParam("value")->value().toInt();
+
+      set_dual_esc_pwm(value);
+      Serial.printf("Updating both ESCs to PWM value %d us\n", value);
+      
+      request->send(200, "text/plain", "OK");
+    } else {
+      request->send(400, "text/plain", "Bad Request");
+    }
+  });
+
+  // Start the server
+  server.begin();
+}
+
+// --- Loop Function ---
+void loop() {
+  // Loop is empty because AsyncWebServer handles requests asynchronously.
+}
+
+// --- PWM Helper Function ---
+
+// Sets the PWM duty cycle for both ESCs using the ESP32Servo library
+void set_dual_esc_pwm(int value_us) {
+  // Ensure the value is within a reasonable range
+  value_us = constrain(value_us, 500, 2500); 
+  
+  // Write the pulse width in microseconds to both servos
+  esc1.writeMicroseconds(value_us);
+  esc2.writeMicroseconds(value_us);
+}
